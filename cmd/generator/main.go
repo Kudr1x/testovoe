@@ -28,7 +28,7 @@ func main() {
 		log.Fatalf("Error: %s", err)
 	}
 
-	const outputFileName = "/home/kudrix/GolandProjects/testovoeOtVaiki/data/input.txt"
+	const outputFileName = "./data/input.txt"
 
 	file, err := os.Create(outputFileName)
 	if err != nil {
