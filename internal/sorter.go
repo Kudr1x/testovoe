@@ -2,8 +2,8 @@ package internal
 
 import (
 	"bufio"
+	"container/heap"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
@@ -11,43 +11,42 @@ import (
 	"strings"
 )
 
+type heapItem struct {
+	word      string
+	count     int
+	fileIndex int
+}
+
+type minHeap []heapItem
+
+func (h minHeap) Len() int           { return len(h) }
+func (h minHeap) Less(i, j int) bool { return h[i].count > h[j].count }
+func (h minHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *minHeap) Push(x interface{}) {
+	*h = append(*h, x.(heapItem))
+}
+func (h *minHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
 func sortAndMerge(cfg Config) error {
-	files, err := ioutil.ReadDir(cfg.TempPath)
+	files, err := os.ReadDir(cfg.TempPath)
 	if err != nil {
 		return fmt.Errorf("could not read temp directory: %w", err)
 	}
 
-	var chunks []string
-	var currentChunkData []fileData
-
-	for i, file := range files {
-		if file.IsDir() {
-			continue
-		}
-
-		num, err := readNumberFromFile(filepath.Join(cfg.TempPath, file.Name()))
-		if err != nil {
-			return fmt.Errorf("error reading number from %s: %w", file.Name(), err)
-		}
-
-		currentChunkData = append(currentChunkData, fileData{Name: file.Name(), Num: num})
-
-		if len(currentChunkData) == cfg.ChunkSize || i == len(files)-1 {
-			sort.Slice(currentChunkData, func(i, j int) bool {
-				return currentChunkData[i].Num > currentChunkData[j].Num
-			})
-
-			chunkFile := filepath.Join(cfg.TempPath, fmt.Sprintf("sorted_chunk_%d.txt", len(chunks)))
-			if err := saveChunkToFile(chunkFile, currentChunkData); err != nil {
-				return fmt.Errorf("could not save chunk to file: %w", err)
-			}
-
-			chunks = append(chunks, chunkFile)
-			currentChunkData = nil
+	var chunkFiles []string
+	for _, file := range files {
+		if !file.IsDir() {
+			chunkFiles = append(chunkFiles, filepath.Join(cfg.TempPath, file.Name()))
 		}
 	}
 
-	return mergeSortedChunks(chunks, cfg.OutputPath)
+	return mergeSortedChunks(chunkFiles, cfg.OutputPath)
 }
 
 func mergeSortedChunks(chunkFiles []string, outputFile string) error {
@@ -61,8 +60,8 @@ func mergeSortedChunks(chunkFiles []string, outputFile string) error {
 
 	var scanners []*bufio.Scanner
 	var files []*os.File
-	var heap []fileData
-	var fileIndexMap = make(map[int]int)
+	h := &minHeap{}
+	heap.Init(h)
 
 	for i, chunkFile := range chunkFiles {
 		file, err := os.Open(chunkFile)
@@ -75,47 +74,42 @@ func mergeSortedChunks(chunkFiles []string, outputFile string) error {
 		scanners = append(scanners, scanner)
 
 		if scanner.Scan() {
-			var name string
-			var num int
-			fmt.Sscanf(scanner.Text(), "%s %d", &name, &num)
-			heap = append(heap, fileData{Name: name, Num: num})
-			fileIndexMap[len(heap)-1] = i
+			parts := strings.Split(scanner.Text(), "\t")
+			if len(parts) == 2 {
+				count, _ := strconv.Atoi(parts[1])
+				heap.Push(h, heapItem{word: parts[0], count: count, fileIndex: i})
+			}
 		}
 	}
 
-	for len(heap) > 0 {
-		maxIndexInHeap := 0
-		for i := 1; i < len(heap); i++ {
-			if heap[i].Num > heap[maxIndexInHeap].Num {
-				maxIndexInHeap = i
+	wordTotals := make(map[string]int)
+
+	for h.Len() > 0 {
+		item := heap.Pop(h).(heapItem)
+		wordTotals[item.word] += item.count
+
+		scanner := scanners[item.fileIndex]
+		if scanner.Scan() {
+			parts := strings.Split(scanner.Text(), "\t")
+			if len(parts) == 2 {
+				count, _ := strconv.Atoi(parts[1])
+				heap.Push(h, heapItem{word: parts[0], count: count, fileIndex: item.fileIndex})
 			}
 		}
+	}
 
-		best := heap[maxIndexInHeap]
-		if _, err := writer.WriteString(fmt.Sprintf("%s %d\n", best.Name, best.Num)); err != nil {
+	finalData := make([]fileData, 0, len(wordTotals))
+	for word, count := range wordTotals {
+		finalData = append(finalData, fileData{Name: word, Num: count})
+	}
+
+	sort.Slice(finalData, func(i, j int) bool {
+		return finalData[i].Num > finalData[j].Num
+	})
+
+	for _, data := range finalData {
+		if _, err := writer.WriteString(fmt.Sprintf("%s\t%d\n", data.Name, data.Num)); err != nil {
 			return err
-		}
-
-		originalFileIndex := fileIndexMap[maxIndexInHeap]
-		if scanners[originalFileIndex].Scan() {
-			var name string
-			var num int
-			fmt.Sscanf(scanners[originalFileIndex].Text(), "%s %d", &name, &num)
-			heap[maxIndexInHeap] = fileData{Name: name, Num: num}
-		} else {
-			heap = append(heap[:maxIndexInHeap], heap[maxIndexInHeap+1:]...)
-			delete(fileIndexMap, maxIndexInHeap)
-			newMap := make(map[int]int)
-			i := 0
-			for j, fi := range fileIndexMap {
-				if j > maxIndexInHeap {
-					newMap[i] = fi
-				} else {
-					newMap[i] = fi
-				}
-				i++
-			}
-			fileIndexMap = newMap
 		}
 	}
 
@@ -124,31 +118,4 @@ func mergeSortedChunks(chunkFiles []string, outputFile string) error {
 	}
 
 	return nil
-}
-
-func readNumberFromFile(path string) (int, error) {
-	data, err := ioutil.ReadFile(path)
-	if err != nil {
-		return 0, err
-	}
-	num, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil {
-		return 0, err
-	}
-	return num, nil
-}
-
-func saveChunkToFile(filename string, chunk []fileData) error {
-	file, err := os.Create(filename)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	writer := bufio.NewWriter(file)
-	for _, data := range chunk {
-		if _, err := writer.WriteString(fmt.Sprintf("%s %d\n", data.Name, data.Num)); err != nil {
-			return err
-		}
-	}
-	return writer.Flush()
 }

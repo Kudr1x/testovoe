@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"strconv"
+	"sort"
 )
 
 func countFrequencies(cfg Config) error {
@@ -15,20 +15,27 @@ func countFrequencies(cfg Config) error {
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
-	chunk := make([]string, 0, cfg.ChunkSize)
+	wordCounts := make(map[string]int)
+	chunkCounter := 0
 
 	for scanner.Scan() {
-		chunk = append(chunk, scanner.Text())
-		if len(chunk) == cfg.ChunkSize {
-			if err := processChunk(chunk, cfg.TempPath); err != nil {
+		word := scanner.Text()
+		if word == "" {
+			continue
+		}
+		wordCounts[word]++
+
+		if len(wordCounts) >= cfg.ChunkSize {
+			if err := processChunk(wordCounts, cfg.TempPath, chunkCounter); err != nil {
 				return err
 			}
-			chunk = make([]string, 0, cfg.ChunkSize)
+			wordCounts = make(map[string]int)
+			chunkCounter++
 		}
 	}
 
-	if len(chunk) > 0 {
-		if err := processChunk(chunk, cfg.TempPath); err != nil {
+	if len(wordCounts) > 0 {
+		if err := processChunk(wordCounts, cfg.TempPath, chunkCounter); err != nil {
 			return err
 		}
 	}
@@ -36,44 +43,28 @@ func countFrequencies(cfg Config) error {
 	return scanner.Err()
 }
 
-func processChunk(chunk []string, tempPath string) error {
-	for _, line := range chunk {
-		if line == "" {
-			continue
-		}
-
-		fileName := tempPath + "/" + line
-		file, err := os.OpenFile(fileName, os.O_CREATE|os.O_RDWR, 0644)
-		if err != nil {
-			return fmt.Errorf("failed to open file %s: %w", fileName, err)
-		}
-
-		scanner := bufio.NewScanner(file)
-		value := 1
-		if scanner.Scan() {
-			value, err = strconv.Atoi(scanner.Text())
-			if err != nil {
-				file.Close()
-				return fmt.Errorf("failed to parse value in %s: %w", fileName, err)
-			}
-			value++
-
-			if _, err = file.Seek(0, 0); err != nil {
-				file.Close()
-				return fmt.Errorf("failed to seek file %s: %w", fileName, err)
-			}
-			if err = file.Truncate(0); err != nil {
-				file.Close()
-				return fmt.Errorf("failed to truncate file %s: %w", fileName, err)
-			}
-		}
-
-		if _, err := file.WriteString(strconv.Itoa(value)); err != nil {
-			file.Close()
-			return fmt.Errorf("failed to write to file %s: %w", fileName, err)
-		}
-
-		file.Close()
+func processChunk(wordCounts map[string]int, tempPath string, chunkCounter int) error {
+	fileName := fmt.Sprintf("%s/chunk_%d.txt", tempPath, chunkCounter)
+	file, err := os.Create(fileName)
+	if err != nil {
+		return fmt.Errorf("failed to create chunk file %s: %w", fileName, err)
 	}
-	return nil
+	defer file.Close()
+
+	writer := bufio.NewWriter(file)
+
+	words := make([]string, 0, len(wordCounts))
+	for word := range wordCounts {
+		words = append(words, word)
+	}
+	sort.Strings(words)
+
+	for _, word := range words {
+		line := fmt.Sprintf("%s\t%d\n", word, wordCounts[word])
+		if _, err := writer.WriteString(line); err != nil {
+			return fmt.Errorf("failed to write to chunk file %s: %w", fileName, err)
+		}
+	}
+
+	return writer.Flush()
 }
